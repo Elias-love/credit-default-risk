@@ -1,0 +1,9 @@
+# 数据与中间产物不入库
+data/*.csv
+data/*.pkl
+output/
+*.tar.gz
+__pycache__/
+.venv/
+.idea/
+.DS_Store

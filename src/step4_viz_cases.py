@@ -15,7 +15,10 @@ from sklearn.metrics import roc_curve, roc_auc_score
 import platform
 _sys = platform.system()
 if _sys == 'Darwin':
-    plt.rcParams['font.family'] = 'PingFang SC'
+    _candidates = ['PingFang SC', 'Heiti TC', 'Hiragino Sans GB', 'Arial Unicode MS', 'STHeiti']
+    _available = {f.name for f in font_manager.fontManager.ttflist}
+    _chosen = next((c for c in _candidates if c in _available), 'Heiti TC')
+    plt.rcParams['font.family'] = _chosen
 elif _sys == 'Windows':
     plt.rcParams['font.family'] = 'Microsoft YaHei'
 else:

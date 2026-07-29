@@ -121,8 +121,8 @@ d10 = te.copy(); d10['dec'] = pd.qcut(d10['prob'], 10, labels=False, duplicates=
 gg = d10.groupby('dec').agg(pred=('prob','mean'), act=('y','mean'))
 ax8.plot(gg['pred']*100, gg['act']*100, marker='o', color='#d4622a', label='分箱均值')
 ax8.plot([0,100],[0,100],'k--',lw=1,alpha=0.4,label='完美校准线')
-ax8.set_xlabel('平均预测概率 %(scale_pos_weight 加权后偏高)'); ax8.set_ylabel('实际违约率 %')
-ax8.set_title('图8  校准检查:排序有效,绝对概率偏高需校准', fontsize=13, fontweight='bold'); ax8.legend()
+ax8.set_xlabel('平均校准后 PD %'); ax8.set_ylabel('实际违约率 %')
+ax8.set_title('图8  Isotonic 校准后预测 PD vs 实际违约率', fontsize=13, fontweight='bold'); ax8.legend()
 
 plt.tight_layout()
 plt.savefig('output/analysis_charts.png', dpi=110, bbox_inches='tight')

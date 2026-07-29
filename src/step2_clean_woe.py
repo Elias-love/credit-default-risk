@@ -4,48 +4,20 @@ import os
 os.makedirs("output", exist_ok=True)
 import pandas as pd
 import numpy as np
+from modeling import FinancialFeatureTransformer
 
 df = pd.read_pickle('data/df_raw.pkl')
 print(f"清洗前: {df.shape}")
 
-# ---------- 清洗规则(每条都有业务理由,写进报告) ----------
-# R1: age=0 属录入错误(1条),删除
+# ---------- 探索性清洗与 WOE/IV ----------
+# age=0 属确定性录入错误(1条),删除。其余需要估计统计量的清洗统一走
+# FinancialFeatureTransformer；此处在全量数据上拟合仅用于探索性 WOE/IV，
+# 生产模型会在 step3 中严格只用训练折拟合，不复用这里的统计量。
 df = df[df['age'] > 0].copy()
-
-# R2: 逾期次数 96/98 为数据源特殊编码(269条,三个字段同时为96/98)。
-#     这类客户违约率极高(~55%),不是随机错误 => 不删除,截断至正常上限,
-#     并保留一个"曾出现特殊编码"标记(等价于"状态异常客户")
-df['pd_special_flag'] = (df['pd_30_59'] >= 90).astype(int)
-for c in ['pd_30_59', 'pd_60_89', 'pd_90']:
-    cap = df.loc[df[c] < 90, c].max()
-    df[c] = df[c].clip(upper=cap)
-
-# R3: 收入缺失(19.8%) => 不删除(缺失本身可能有信息),
-#     用中位数填充 + 缺失标记列
-df['income_missing'] = df['monthly_income'].isnull().astype(int)
-df['monthly_income'] = df['monthly_income'].fillna(df['monthly_income'].median())
-
-# R4: dependents 缺失(2.6%) => 众数0填充
-df['dependents'] = df['dependents'].fillna(0)
-
-# R5: credit_util 与 debt_ratio 极端值 => 99.5分位截断(保留排序信息,消除量纲爆炸)
-for c in ['credit_util', 'debt_ratio']:
-    q = df[c].quantile(0.995)
-    df[f'{c}_capped_flag'] = (df[c] > q).astype(int)
-    df[c] = df[c].clip(upper=q)
-
-# ---------- 特征工程(财务视角) ----------
-# F1: 逾期严重度加权分 —— 类似账龄加权,90+权重最高
-df['delinq_score'] = df['pd_30_59']*1 + df['pd_60_89']*2 + df['pd_90']*3
-# F2: 是否有任何逾期史(最强单一二元信号)
-df['ever_past_due'] = ((df['pd_30_59']+df['pd_60_89']+df['pd_90']) > 0).astype(int)
-# F3: 月债务额 = 债务比 × 月收入(还原绝对负担)
-df['monthly_debt'] = df['debt_ratio'] * df['monthly_income']
-# F4: 人均可支配收入 = 收入 / (1+抚养人数)
-df['income_per_capita'] = df['monthly_income'] / (1 + df['dependents'])
-# F5: 无抵押账户占比(信用卡类账户 vs 房贷类账户结构)
-df['unsecured_ratio'] = (df['open_credit_lines'] - df['real_estate_loans']).clip(lower=0) / df['open_credit_lines'].replace(0, np.nan)
-df['unsecured_ratio'] = df['unsecured_ratio'].fillna(0)
+target = df.pop("default_2y")
+transformer = FinancialFeatureTransformer().fit(df)
+df = transformer.transform(df)
+df["default_2y"] = target
 
 print(f"清洗后: {df.shape}, 违约率: {df['default_2y'].mean():.2%}")
 
@@ -53,7 +25,9 @@ print(f"清洗后: {df.shape}, 违约率: {df['default_2y'].mean():.2%}")
 def woe_iv(series, target, bins=8):
     """等频分箱计算 WOE/IV;离散少值变量按取值分箱"""
     d = pd.DataFrame({'x': series, 'y': target})
-    if d['x'].nunique() <= 10:
+    # 逾期次数等零膨胀离散变量即使有十几个取值也不应强行 qcut；
+    # 大量 0 会让分位边界重复，严重时只剩一个箱、IV 被错误算成 0。
+    if d['x'].nunique() <= 20:
         d['bin'] = d['x']
     else:
         d['bin'] = pd.qcut(d['x'], q=bins, duplicates='drop')

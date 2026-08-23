@@ -27,7 +27,9 @@ from sklearn.preprocessing import StandardScaler
 from modeling import (
     FinancialFeatureTransformer,
     MODEL_FEATURES,
+    ModelFeatureSelector,
     make_tier_bins,
+    tier_bin_health,
 )
 
 
@@ -48,19 +50,27 @@ y = raw["default_2y"]
 X_train, X_te_raw, y_train, y_te = train_test_split(
     X_raw, y, test_size=0.30, random_state=42, stratify=y
 )
-# 内层验证集用于选树数、拟合概率校准器、确定风险分层阈值。
+# 内层验证集再拆成两份互不相交的子集，避免同一批样本同时承担三种用途：
+#   val_select —— 选树数，并在校准之后用来确定风险分层阈值
+#   val_cal    —— 只用于拟合等温校准器
+# 这样分层阈值读到的是"校准器没见过"的概率，不会因等温回归的平台值而退化。
 X_fit_raw, X_val_raw, y_fit, y_val = train_test_split(
     X_train, y_train, test_size=0.20, random_state=43, stratify=y_train
 )
+X_sel_raw, X_cal_raw, y_sel, y_cal = train_test_split(
+    X_val_raw, y_val, test_size=0.50, random_state=44, stratify=y_val
+)
 print(
-    f"建模集 {len(X_fit_raw):,} | 验证集 {len(X_val_raw):,} | "
+    f"建模集 {len(X_fit_raw):,} | 验证集 {len(X_val_raw):,} "
+    f"(选模 {len(X_sel_raw):,} / 校准 {len(X_cal_raw):,}) | "
     f"冻结测试集 {len(X_te_raw):,}（违约率 {y_te.mean():.2%}）"
 )
 
 # 只用建模集学习中位数、截断分位数和特殊编码上限。
 feature_transformer = FinancialFeatureTransformer().fit(X_fit_raw)
 X_fit = feature_transformer.transform(X_fit_raw)[MODEL_FEATURES]
-X_val = feature_transformer.transform(X_val_raw)[MODEL_FEATURES]
+X_sel = feature_transformer.transform(X_sel_raw)[MODEL_FEATURES]
+X_cal = feature_transformer.transform(X_cal_raw)[MODEL_FEATURES]
 X_te = feature_transformer.transform(X_te_raw)[MODEL_FEATURES]
 
 results = {}
@@ -96,10 +106,10 @@ for n_estimators in candidate_estimators:
         verbose=-1,
     )
     candidate.fit(X_fit, y_fit)
-    val_prob = candidate.predict_proba(X_val)[:, 1]
+    sel_prob = candidate.predict_proba(X_sel)[:, 1]
     validation_rows.append({
         "n_estimators": n_estimators,
-        "validation_auc": roc_auc_score(y_val, val_prob),
+        "validation_auc": roc_auc_score(y_sel, sel_prob),
     })
     candidate_models[n_estimators] = candidate
 
@@ -110,16 +120,18 @@ best_n = int(
     ).iloc[0]["n_estimators"]
 )
 lgbm = candidate_models[best_n]
-print("\n===== 验证集选树数（测试集未参与） =====")
+print("\n===== 选模子集选树数（校准子集与测试集均未参与） =====")
 print(validation_df.to_string(index=False, float_format=lambda v: f"{v:.5f}"))
 print(f"选择 n_estimators={best_n}")
 
-# ---------- 概率校准 ----------
-p_val_raw = lgbm.predict_proba(X_val)[:, 1]
+# ---------- 概率校准：只用 val_cal 拟合 ----------
+p_cal_raw = lgbm.predict_proba(X_cal)[:, 1]
+p_sel_raw = lgbm.predict_proba(X_sel)[:, 1]
 p_gbm_raw = lgbm.predict_proba(X_te)[:, 1]
 calibrator = IsotonicRegression(out_of_bounds="clip")
-calibrator.fit(p_val_raw, y_val)
-p_val = calibrator.transform(p_val_raw)
+calibrator.fit(p_cal_raw, y_cal)
+# 分层阈值读的是选模子集——校准器没有在它上面拟合过，因此不会落在平台值上。
+p_sel = calibrator.transform(p_sel_raw)
 p_gbm = calibrator.transform(p_gbm_raw)
 
 results["LightGBM"] = {
@@ -132,8 +144,12 @@ results["LightGBM"] = {
 }
 
 # 5 折 CV 中每一折独立拟合 FinancialFeatureTransformer，避免预处理泄漏。
+# ModelFeatureSelector 让 CV 用到的特征与最终模型完全一致（17 个）。
+# 少了这一步，Pipeline 会把 *_capped_flag 等诊断列也喂给模型，
+# CV AUC 与冻结测试集 AUC 就成了两个口径，并列在报告里会误导。
 cv_model = Pipeline([
     ("features", FinancialFeatureTransformer()),
+    ("select", ModelFeatureSelector()),
     ("model", lgb.LGBMClassifier(
         n_estimators=best_n,
         learning_rate=0.03,
@@ -177,8 +193,15 @@ imp = pd.DataFrame({
 imp["gain_pct"] = imp["gain"] / imp["gain"].sum()
 imp = imp.sort_values("gain", ascending=False).reset_index(drop=True)
 
-# ---------- 风险分层：阈值由验证集确定，冻结后应用到测试集 ----------
-bins = make_tier_bins(p_val)
+# ---------- 风险分层：阈值由"校准器未见过"的选模子集确定，冻结后应用到测试集 ----------
+tier_health = tier_bin_health(p_sel)
+print(
+    "\n===== 分层阈值健康度（阈值样本：选模子集，校准器未见过）====="
+    f"\n样本量 {tier_health['sample_size']:,}｜"
+    f"不同概率取值 {tier_health['distinct_probabilities']:,}｜"
+    f"退化切点 {tier_health['collapsed_cutoffs']}"
+)
+bins = make_tier_bins(p_sel, strict=True)
 te = X_te.copy()
 te["y"] = y_te.values
 te["prob_raw"] = p_gbm_raw
@@ -218,6 +241,9 @@ with open("data/model_artifacts.pkl", "wb") as f:
         "y_te": y_te,
         "p_gbm": p_gbm,
         "p_gbm_raw": p_gbm_raw,
+        "p_sel": p_sel,
+        "y_sel": y_sel,
+        "tier_health": tier_health,
         "p_lr": p_lr,
         "imp": imp,
         "tier": tier,

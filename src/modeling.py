@@ -21,6 +21,27 @@ MODEL_FEATURES = [
 ]
 
 
+class ModelFeatureSelector(BaseEstimator, TransformerMixin):
+    """把特征工程的输出收敛到与最终模型完全一致的特征集。
+
+    FinancialFeatureTransformer.transform 会保留原始列并额外产出
+    ``*_capped_flag`` 等诊断列。若直接把它接进交叉验证的 Pipeline，CV 用到的
+    特征就比最终模型多，两个 AUC 不同口径、不可比。放这一步在中间即可对齐。
+    """
+
+    def fit(self, X: pd.DataFrame, y=None):
+        missing = [c for c in MODEL_FEATURES if c not in X.columns]
+        if missing:
+            raise ValueError(f"缺少建模特征: {missing}")
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        return X[MODEL_FEATURES]
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(MODEL_FEATURES, dtype=object)
+
+
 class FinancialFeatureTransformer(BaseEstimator, TransformerMixin):
     """训练集拟合、任意数据集复用的清洗与财务特征工程。"""
 
@@ -82,11 +103,45 @@ class FinancialFeatureTransformer(BaseEstimator, TransformerMixin):
         return frame
 
 
-def make_tier_bins(probabilities) -> np.ndarray:
-    """用验证集概率生成可冻结到测试/生产数据的 A-E 分层阈值。"""
-    bins = np.quantile(probabilities, [0, 0.40, 0.70, 0.90, 0.97, 1.0])
+TIER_QUANTILES = [0, 0.40, 0.70, 0.90, 0.97, 1.0]
+
+
+def make_tier_bins(probabilities, *, strict: bool = False) -> np.ndarray:
+    """用验证集概率生成可冻结到测试/生产数据的 A-E 分层阈值。
+
+    注意口径：传入的概率必须是**校准器没有见过**的样本上的输出。等温回归在
+    自身训练样本上的输出会大量落到同一段平台值，分位点因此高度重合，只能靠
+    ``np.nextafter`` 强行错开——那样得到的 A/B 边界实际上没有区分度。
+
+    ``strict=True`` 时遇到重合分位点直接报错，而不是悄悄补一个相邻浮点数。
+    """
+    probabilities = np.asarray(probabilities, dtype=float)
+    bins = np.quantile(probabilities, TIER_QUANTILES)
+    degenerate = [
+        (TIER_QUANTILES[i], TIER_QUANTILES[i - 1])
+        for i in range(1, len(bins) - 1)
+        if bins[i] <= bins[i - 1]
+    ]
+    if degenerate and strict:
+        raise ValueError(
+            f"分层阈值退化（分位点取值重合）: {degenerate}；"
+            "请改用校准器未见过的样本计算阈值"
+        )
     bins[0], bins[-1] = -np.inf, np.inf
     for i in range(1, len(bins) - 1):
         if bins[i] <= bins[i - 1]:
             bins[i] = np.nextafter(bins[i - 1], np.inf)
     return bins
+
+
+def tier_bin_health(probabilities) -> dict:
+    """诊断分层阈值是否真的有区分度，供报告与测试断言使用。"""
+    probabilities = np.asarray(probabilities, dtype=float)
+    raw = np.quantile(probabilities, TIER_QUANTILES)
+    inner = raw[1:-1]
+    return {
+        "distinct_probabilities": int(np.unique(probabilities).size),
+        "sample_size": int(probabilities.size),
+        "inner_cutoffs": inner.tolist(),
+        "collapsed_cutoffs": int(np.sum(np.diff(inner) <= 0)),
+    }

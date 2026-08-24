@@ -44,15 +44,22 @@ python src/step3_model.py        # 逻辑回归基线 + LightGBM + 风险分层
 python src/step4_viz_cases.py    # 8 张图表 + SHAP 个体案例归因
 ```
 
-全流程固定随机种子；`src/modeling.py` 封装可复用的 sklearn 特征转换器，交叉验证每折独立拟合预处理统计量。
+> **macOS 提示**：LightGBM 依赖 OpenMP 运行库。若 `import lightgbm` 报
+> `Library not loaded: @rpath/libomp.dylib`，需先 `brew install libomp`；
+> 已有 libomp 但不在默认搜索路径时，可用 `DYLD_LIBRARY_PATH=<libomp所在目录> python src/step3_model.py`。
+
+全流程固定随机种子；`src/modeling.py` 封装可复用的 sklearn 特征转换器，交叉验证每折独立拟合预处理统计量，
+并由 `ModelFeatureSelector` 把 CV 的特征集收敛到与主模型完全一致的 17 个，保证两个 AUC 同口径可比。
 
 ## 目录结构
 
 ```
-├── src/                 # 4 个分析脚本(按序运行)
+├── src/                 # step1~step4 四个分析脚本(按序运行) + modeling.py(可复用组件)
+├── tests/               # 单元测试(7 用例)：python -m pytest
 ├── docs/                # 完整分析报告(过程/解读/案例)
 ├── assets/              # 图表与 IV 排名
-├── data/                # 数据目录(需按上述命令自行下载)
+├── data/                # 数据目录(需按上述命令自行下载,不入库)
+├── .github/workflows/   # CI
 └── requirements.txt
 ```
 
@@ -70,3 +77,7 @@ python src/step4_viz_cases.py    # 8 张图表 + SHAP 个体案例归因
 - [ ] Streamlit 交互式风险看板(客户列表 + 风险分 + SHAP 瀑布图)
 - [ ] 与 [finance-rag-qa](https://github.com/Elias-love/finance-rag-qa) 的 NL2SQL 模块打通,实现"一句话查客户风险画像"
 - [x] Isotonic 概率校准层 + 冻结风险阈值（校准与定阈使用互不相交的验证子集）
+
+## License
+
+MIT
